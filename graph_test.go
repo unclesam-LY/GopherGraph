@@ -251,3 +251,69 @@ func TestParallelExecution(t *testing.T) {
 		}
 	}
 }
+
+// TestFileCheckpointer 测试文件检查点管理器对工作流进度的持久化与恢复
+func TestFileCheckpointer(t *testing.T) {
+	// 创建测试临时文件夹（测试结束后 Go 会自动清理）
+	tmpDir := t.TempDir()
+	fc, err := NewFileCheckpointer[TestState](tmpDir)
+	if err != nil {
+		t.Fatalf("创建文件检查点管理器失败: %v", err)
+	}
+
+	g := NewGraph[TestState]()
+	g.AddNode("A", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Value = 100
+		return s, nil
+	})
+	g.AddNode("B", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Value += 200
+		return s, nil
+	})
+
+	g.AddEdge("A", "B")
+	g.AddInterrupt("B") // 暂停在 B 之前
+
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+
+	// 1. 运行并触发中断
+	thread, err := cg.Start(context.Background(), "A", TestState{Value: 0})
+	if err != nil {
+		t.Fatalf("运行失败: %v", err)
+	}
+	if !thread.IsPaused || thread.State.Value != 100 {
+		t.Fatalf("未成功触发中断，当前值: %d", thread.State.Value)
+	}
+
+	// 2. 模拟人工介入前：将线程快照（内存数据）写入磁盘
+	sessionID := "test-session-123"
+	ctx := context.Background()
+	if err := fc.Save(ctx, sessionID, thread); err != nil {
+		t.Fatalf("保存状态失败: %v", err)
+	}
+
+	// 3. 从磁盘重新读取状态（模拟程序崩掉重启后，重新从文件加载）
+	loadedThread, err := fc.Load(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("读取状态失败: %v", err)
+	}
+
+	// 校验反序列化出来的状态是否完好无损
+	if loadedThread.NextNode != "B" || !loadedThread.IsPaused || loadedThread.State.Value != 100 {
+		t.Fatalf("加载出的状态不符合预期: %+v", loadedThread)
+	}
+
+	// 4. 使用从磁盘加载出来的线程指针，传入新状态恢复执行
+	thread, err = cg.Resume(ctx, loadedThread, TestState{Value: 500})
+	if err != nil {
+		t.Fatalf("恢复执行失败: %v", err)
+	}
+
+	// 验证最终执行结果: 500 + 200 = 700
+	if !thread.IsFinished || thread.State.Value != 700 {
+		t.Errorf("执行结果错误，最终值: %d, 是否结束: %t", thread.State.Value, thread.IsFinished)
+	}
+}
