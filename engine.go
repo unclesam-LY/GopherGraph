@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // Thread 代表图执行的具体实例快照（线程上下文）
@@ -21,6 +22,7 @@ type CompiledGraph[S any] struct {
 	edges       map[string]string
 	conditional map[string]RouterFn[S]
 	interrupts  map[string]bool
+	parallels   map[string]parallelStep[S]
 }
 
 // Compile 校验图结构的合法性，并生成可运行的 CompiledGraph。
@@ -53,12 +55,37 @@ func (g *Graph[S]) Compile() (*CompiledGraph[S], error) {
 		}
 	}
 
+	// 校验并发连线边的有效性
+	for from, step := range g.parallels {
+		if _, exists := g.nodes[from]; !exists {
+			return nil, fmt.Errorf("compile error: parallel edge origin %q does not exist", from)
+		}
+		if len(step.targets) == 0 {
+			return nil, fmt.Errorf("compile error: parallel edge from %q has no targets", from)
+		}
+
+		for _, target := range step.targets {
+			if _, exists := g.nodes[target]; !exists {
+				return nil, fmt.Errorf("compile error: parallel target %q from %q does not exist", target, from)
+			}
+		}
+		if step.next != "" {
+			if _, exists := g.nodes[step.next]; !exists {
+				return nil, fmt.Errorf("compile error: parallel next node %q from %q does not exist", step.next, from)
+			}
+		}
+		if step.merger == nil {
+			return nil, fmt.Errorf("compile error: parallel step from %q has nil merger", from)
+		}
+	}
+
 	// 返回编译好的只读图
 	return &CompiledGraph[S]{
 		nodes:       g.nodes,
 		edges:       g.edges,
 		conditional: g.conditional,
 		interrupts:  g.interrupts,
+		parallels:   g.parallels,
 	}, nil
 }
 
@@ -117,14 +144,51 @@ func (cg *CompiledGraph[S]) run(ctx context.Context, thread *Thread[S]) (*Thread
 
 		// 计算下一个该执行的节点名称
 		var nextNode string
-		if routerFn, ok := cg.conditional[currentNodeName]; ok {
+		if step, isParallel := cg.parallels[currentNodeName]; isParallel {
+			// 【处理并发分流】
+			var wg sync.WaitGroup
+			branches := make([]S, len(step.targets))
+			errs := make([]error, len(step.targets))
+			for i, target := range step.targets {
+				wg.Add(1)
+				// 启动并发协程运行分支节点。传入 thread.State 的副本（Go 默认是值拷贝）
+				go func(idx int, targetNode string, stateCopy S) {
+					defer wg.Done()
+					if ctx.Err() != nil {
+						errs[idx] = ctx.Err()
+						return
+					}
+					nodeFn := cg.nodes[targetNode]
+					resState, err := nodeFn(ctx, stateCopy)
+					if err != nil {
+						errs[idx] = err
+						return
+					}
+					branches[idx] = resState
+				}(i, target, thread.State)
+			}
+			// 等待所有分支协程执行完毕
+			wg.Wait()
+			// 检查是否有任何分支报错
+			for _, err := range errs {
+				if err != nil {
+					return thread, fmt.Errorf("parallel branch execution error: %w", err)
+				}
+			}
+			// 【状态合并】调用用户自定义的合并函数
+			mergedState, err := step.merger(ctx, thread.State, branches)
+			if err != nil {
+				return thread, fmt.Errorf("parallel merger execution error: %w", err)
+			}
+			thread.State = mergedState
+			nextNode = step.next
+		} else if routerFn, ok := cg.conditional[currentNodeName]; ok {
 			// 如果有条件路由函数，则通过路由函数动态计算去向
 			next, err := routerFn(ctx, thread.State)
 			if err != nil {
 				return thread, fmt.Errorf("router for node %q execution error: %w", currentNodeName, err)
 			}
 			nextNode = next
-
 		} else {
 			// 否则使用静态连线边
 			nextNode = cg.edges[currentNodeName]

@@ -3,6 +3,7 @@ package GopherGraph
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -188,5 +189,65 @@ func TestTimeoutCancellation(t *testing.T) {
 	_, err = cg.Start(ctx, "A", TestState{})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("期望返回 context.DeadlineExceeded 错误，实际返回: %v", err)
+	}
+}
+
+// TestParallelExecution 测试并发分流与合并逻辑 (start -> [task1, task2 并发] -> merger -> end)
+func TestParallelExecution(t *testing.T) {
+	g := NewGraph[TestState]()
+	// 1. 注册节点
+	g.AddNode("start", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Log = append(s.Log, "start")
+		return s, nil
+	})
+	g.AddNode("task1", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Log = append(s.Log, "task1")
+		s.Value += 10
+		return s, nil
+	})
+	g.AddNode("task2", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Log = append(s.Log, "task2")
+		s.Value += 20
+		return s, nil
+	})
+	g.AddNode("end", func(ctx context.Context, s TestState) (TestState, error) {
+		s.Log = append(s.Log, "end")
+		return s, nil
+	})
+	// 定义合并函数：将分支产生的 Value 相加，合并日志
+	merger := func(ctx context.Context, parent TestState, branches []TestState) (TestState, error) {
+		parent.Log = append(parent.Log, "merged")
+		for _, b := range branches {
+			parent.Value += b.Value
+			parent.Log = append(parent.Log, b.Log...)
+		}
+		return parent, nil
+	}
+	// 2. 建立并发连线：从 start 分流并发执行 task1 和 task2，执行完后通过 merger 合并状态并去往 end 节点
+	g.AddParallelEdges("start", []string{"task1", "task2"}, "end", merger)
+	cg, err := g.Compile()
+	if err != nil {
+		t.Fatalf("编译图失败: %v", err)
+	}
+	// 3. 运行工作流
+	thread, err := cg.Start(context.Background(), "start", TestState{Value: 0})
+	if err != nil {
+		t.Fatalf("启动图失败: %v", err)
+	}
+	// 4. 验证结果
+	if !thread.IsFinished {
+		t.Errorf("期望工作流正常结束")
+	}
+	// 验证 Value 是否被正确累加: task1 (10) + task2 (20) = 30
+	if thread.State.Value != 30 {
+		t.Errorf("期望 Value 为 30，实际为 %d", thread.State.Value)
+	}
+	// 验证日志中是否同时包含两个并发节点的执行结果（且顺序不固定，但都必须存在）
+	logStr := strings.Join(thread.State.Log, ",")
+	expectedLogs := []string{"start", "merged", "task1", "task2", "end"}
+	for _, exp := range expectedLogs {
+		if !strings.Contains(logStr, exp) {
+			t.Errorf("期望日志中包含 %q，实际日志为: %v", exp, thread.State.Log)
+		}
 	}
 }
