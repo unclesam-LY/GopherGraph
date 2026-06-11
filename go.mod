@@ -1,3 +1,3 @@
-module github.com/unclesam-LY/GopherGraph
+module github.com/unclesam-ly/GopherGraph
 
 go 1.26.2
